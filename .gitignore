@@ -4,3 +4,6 @@ venv/
 .env
 *.pdf
 *.docx
+faiss_index/
+file_cache.json
+history_backup/
