@@ -30,12 +30,22 @@ for ext in [".docx", ".doc", ".txt", ".pdf"]:
              glob.glob(os.path.join(SCRIPT_DIR, "*" + ext.upper())):
         raw_files.append(f)
 
-FILES =raw_files
+FILES = []
+_seen_paths = set()
+for f in raw_files:
+    # Windows 的 glob 不区分大小写，*.pdf 和 *.PDF 会命中同一批文件，这里去重
+    key = os.path.normcase(os.path.realpath(f))
+    if key in _seen_paths:
+        continue
+    _seen_paths.add(key)
+    FILES.append(f)
 
 if not FILES:
     print("  没找到可读文件，支持 .docx/.doc/.txt/.pdf")
     print(f"  扫描位置：{SCRIPT_DIR}")
 else:
+    if len(FILES) != len(raw_files):
+        print(f"  扫描到 {len(raw_files)} 个路径，去掉重复后 {len(FILES)} 个")
     print(f"  去重后，参与建库的文件有 {len(FILES)} 个")
 
 # 2. 文件读取模块
@@ -46,15 +56,246 @@ def clean_text(text):
     if not text: return ""
     return '\n'.join([line.strip() for line in text.split('\n') if line.strip()])
 
+# ---------------------------------------------------------------- PDF 解析
+# 同一个 PDF 换引擎结果可能天差地别：pdfplumber 遇到 CID 子集字体会吐乱码，
+# PyMuPDF（pdf2docx 底层用的也是它）通常能正确还原；扫描件没有文字层，只能 OCR。
+def _char_readable(ch):
+    o = ord(ch)
+    return (
+        ch in "\n\t "
+        or 0x20 <= o <= 0x7E                  # ASCII
+        or 0x4E00 <= o <= 0x9FFF              # 常用汉字
+        or 0x3400 <= o <= 0x4DBF              # 扩展 A
+        or 0x3000 <= o <= 0x303F              # 中文标点
+        or 0xFF00 <= o <= 0xFFEF              # 全角
+        or 0x2010 <= o <= 0x2027
+        or 0x00B0 <= o <= 0x00FF
+    )
+
+
+def text_quality(text):
+    """0~1，越高越干净。乱码的典型特征是私用区字符(U+E000+)和替换符(U+FFFD)。"""
+    s = (text or "").strip()
+    if not s:
+        return 0.0
+    total = len(s)
+    readable = sum(1 for ch in s if _char_readable(ch))
+    broken = sum(1 for ch in s if ch == "\ufffd" or 0xE000 <= ord(ch) <= 0xF8FF)
+    return max(0.0, (readable - broken * 2) / total)
+
+
+def _pdf_text_pdfplumber(path):
+    parts = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                parts.append(t)
+    return "\n".join(parts)
+
+
+def _pdf_text_pymupdf(path):
+    import pymupdf
+    parts = []
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            parts.append(page.get_text("text", sort=True))
+    return "\n".join(parts)
+
+
+def _read_docx(path):
+    doc = Document(path)
+    parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return clean_text("\n".join(parts))
+
+
+def _sibling_docx(pdf_path):
+    """PDF 旁边有没有同名的、不比 PDF 旧的 .docx（手动转好的版本）。"""
+    cand = os.path.splitext(pdf_path)[0] + ".docx"
+    if not os.path.exists(cand):
+        return None
+    try:
+        if os.path.getmtime(cand) + 1 < os.path.getmtime(pdf_path):
+            return None
+    except OSError:
+        return None
+    return cand
+
+
+# ---- OCR（扫描件专用）：rapidocr 优先，paddleocr 备选，结果都过质量门
+OCR_ENABLED = os.environ.get("AI_OCR", "1") not in ("0", "false", "False")
+OCR_DPI = int(os.environ.get("AI_OCR_DPI", "200"))
+OCR_MAX_PAGES = int(os.environ.get("AI_OCR_MAX_PAGES", "30"))
+_ocr_engines_cache = {}
+
+
+def _load_rapidocr():
+    from rapidocr_onnxruntime import RapidOCR
+    return RapidOCR()
+
+
+def _read_rapidocr(engine, image):
+    result, _ = engine(image)
+    return [item[1] for item in (result or [])]
+
+
+def _load_paddleocr():
+    from paddleocr import PaddleOCR
+    return PaddleOCR(lang="ch", use_doc_orientation_classify=False,
+                     use_doc_unwarping=False, use_textline_orientation=False)
+
+
+def _read_paddleocr(engine, image):
+    res = engine.predict(image)[0]
+    texts = res.get("rec_texts") if hasattr(res, "get") else None
+    return list(texts or [])
+
+
+def _available_ocr_engines():
+    import importlib.util
+    engines = []
+    if importlib.util.find_spec("rapidocr_onnxruntime"):
+        engines.append(("rapidocr", _load_rapidocr, _read_rapidocr))
+    if importlib.util.find_spec("paddleocr"):
+        engines.append(("paddleocr", _load_paddleocr, _read_paddleocr))
+    pref = os.environ.get("AI_OCR_ENGINE", "").strip().lower()
+    if pref.startswith("paddle"):
+        engines.sort(key=lambda e: 0 if e[0] == "paddleocr" else 1)
+    elif pref.startswith("rapid"):
+        engines.sort(key=lambda e: 0 if e[0] == "rapidocr" else 1)
+    return engines
+
+
+def _render_pdf_pages(path, dpi, max_pages):
+    import numpy as np
+    import pymupdf
+    pages = []
+    with pymupdf.open(path) as doc:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            pix = page.get_pixmap(dpi=dpi)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 4:
+                img = img[:, :, :3]
+            elif pix.n == 1:
+                img = np.repeat(img, 3, axis=2)
+            pages.append(img)
+    return pages
+
+
+def ocr_pdf(path):
+    """整份 PDF 走 OCR；返回纯文本，失败返回 None。"""
+    if not OCR_ENABLED:
+        return None
+    name = os.path.basename(path)
+    engines = _available_ocr_engines()
+    if not engines:
+        print("  [警告] 没有可用的 OCR 引擎，装一个即可：pip install rapidocr-onnxruntime")
+        return None
+    try:
+        pages = _render_pdf_pages(path, OCR_DPI, OCR_MAX_PAGES)
+    except Exception as e:
+        print(f"  [警告] {name} 渲染成图片失败：{e}")
+        return None
+    if not pages:
+        return None
+
+    print(f"  [OCR] {name}：{len(pages)} 页 @{OCR_DPI}dpi，开始识别（每页约 1-10 秒）")
+    for engine_name, loader, reader in engines:
+        try:
+            engine = _ocr_engines_cache.get(engine_name) or loader()
+            _ocr_engines_cache[engine_name] = engine
+        except Exception as e:
+            print(f"  [警告] {engine_name} 初始化失败：{e}")
+            continue
+
+        page_texts, failed = [], False
+        for idx, image in enumerate(pages, 1):
+            try:
+                lines = reader(engine, image)
+            except Exception as e:
+                print(f"  [警告] {engine_name} 第 {idx} 页识别失败：{e}")
+                failed = True
+                break
+            page_texts.append("\n".join(lines))
+            if len(pages) > 3:
+                print(f"         · {idx}/{len(pages)} 页")
+        if failed:
+            continue
+
+        joined = "\n".join(page_texts)
+        quality = text_quality(joined)
+        if joined.strip() and quality >= 0.5:
+            print(f"  [OCR] {engine_name} 完成，质量 {quality:.2f}")
+            return clean_text(joined)
+        print(f"  [警告] {engine_name} 识别结果质量过低（{quality:.2f}），换下一个引擎")
+
+    print(f"  [警告] {name} OCR 没能识别出可用文字")
+    return None
+
+
+def read_pdf(path):
+    """PDF → 文本：同名 docx → 双引擎解析 → OCR。"""
+    name = os.path.basename(path)
+
+    # 1) 同名 docx 优先（本地转换过 / 手动用在线工具转好的）
+    sib = _sibling_docx(path)
+    if sib:
+        try:
+            text = _read_docx(sib)
+            if text and text_quality(text) >= 0.7:
+                print(f"  [提示] {name} 旁边有同名 docx，直接读 {os.path.basename(sib)}")
+                return text
+        except Exception as e:
+            print(f"  [警告] 读取 {os.path.basename(sib)} 失败：{e}")
+
+    # 2) 依次尝试两个引擎，取第一个质量合格的
+    tried = []
+    best = ("", 0.0, "")
+    for engine, fn in (("pdfplumber", _pdf_text_pdfplumber), ("pymupdf", _pdf_text_pymupdf)):
+        try:
+            text = fn(path)
+        except Exception as e:
+            print(f"  [警告] {name} 用 {engine} 解析失败：{e}")
+            continue
+        quality = text_quality(text)
+        tried.append(f"{engine}={quality:.2f}/{len(text.strip())}字")
+        if quality > best[1]:
+            best = (text, quality, engine)
+        if quality >= 0.85 and len(text.strip()) >= 20:
+            if engine != "pdfplumber":
+                print(f"  [提示] {name} pdfplumber 结果偏差较大，已改用 {engine}")
+            return clean_text(text)
+
+    # 3) 文字层缺失或质量太差 → OCR
+    text, quality, engine = best
+    if len(text.strip()) < 20 or quality < 0.85:
+        if len(text.strip()) < 20:
+            print(f"  [提示] {name} 几乎没有文字层（疑似扫描件），改走 OCR")
+        ocr_text = ocr_pdf(path)
+        if ocr_text and text_quality(ocr_text) >= max(quality, 0.5):
+            return ocr_text
+
+    if len(text.strip()) < 20:
+        print(f"  [警告] {name} 提取不到文字，OCR 也没成功")
+        return None
+    if quality < 0.85:
+        print(f"  [警告] {name} 解析质量偏低（{'，'.join(tried)}），结果可能不完整")
+    return clean_text(text)
+
+
 def read_file(file_path):
     ext = os.path.splitext(file_path)[1].lower()
     text = ""
     try:
         if ext == '.pdf':
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text()
-                    if t: text += t + "\n"
+            return read_pdf(file_path)
         elif ext == '.docx':
             doc = Document(file_path)
             text = '\n'.join([p.text for p in doc.paragraphs])
@@ -102,6 +343,7 @@ for mod, pkg in [
     ("langchain_text_splitters", "langchain"),
     ("faiss", "faiss-cpu"),
     ("pypdf", "pypdf"),
+    ("pymupdf", "pymupdf"),
     ("duckduckgo_search", "duckduckgo-search"),
     ("flask", "flask"),
     ("flask_cors", "flask-cors"),
